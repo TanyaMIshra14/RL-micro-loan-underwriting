@@ -1,0 +1,11 @@
+gymnasium
+fastapi
+joblib
+numpy
+pandas
+plotly
+scikit-learn
+shap
+torch
+uvicorn[standard]
+python-multipart
