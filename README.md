@@ -1,126 +1,357 @@
-# RL-micro-loan-underwriting
+# Reinforcement Learning for Micro-Loan Underwriting
 
-An end-to-end Reinforcement Learning (RL) framework designed to optimize credit decisioning, risk assessment, and dynamic capital allocation in micro-lending environments.
-
-Traditional credit underwriting relies heavily on static classification models (e.g., Logistic Regression, GBDT) that score default probability at a single point in time. In real-world micro-finance, lending is inherently sequential: repayment behavior evolves, credit limits dynamically adjust, and portfolio balance requires managing interest yields against capital write-offs. 
-
-This repository formulates micro-loan underwriting as a **Markov Decision Process (MDP)**, training autonomous agents (e.g., DQN, PPO, DDPG) to dynamically determine approval status, credit limits, and interest pricing under strict portfolio capital constraints.
+An end-to-end underwriting system that uses reinforcement learning to decide **whether to approve a loan** and, if approved, **what interest rate (APR) to quote**. The project covers data preprocessing, a custom Gymnasium environment, offline and online RL training, stress testing, a fairness audit, SHAP-based explanations, and a FastAPI web app for live scoring.
 
 ---
 
-## 📌 Key Features
+## Table of Contents
 
-* **Custom Gymnasium Environment:** Simulates applicant arrival, multi-feature risk profiles, dynamic repayments, interest accruals, and default events.
-* **Cost-Sensitive Multi-Objective Reward:** Balances net interest margins, principal loss penalties, customer lifetime value (LTV), and portfolio-level risk caps.
-* **RL Policy Implementations:** Supports discrete action spaces (Approve/Reject/Tiered Limits via DQN/Double-DQN) and continuous action spaces (Exact Credit Limit & Pricing via PPO/SAC/DDPG).
-* **Baseline Benchmarks:** Built-in comparisons against standard heuristics (rule-based thresholds) and supervised baselines (XGBoost/LightGBM credit scoring).
-* **Backtesting & Stress Testing:** Evaluates policy resilience under sudden macroeconomic shocks, elevated default regimes, and liquidity crunches.
-
----
-
-## 🏗️ MDP Formulation
-
-| Component | Description |
-| :--- | :--- |
-| **State ($S_t$)** | Applicant feature vector (income, alternative data score, debt-to-income, repayment history) + Portfolio status (current default rate, available liquidity). |
-| **Action ($A_t$)** | **Discrete:** `0: Reject`, `1: Approve Tier 1 ($)`, `2: Approve Tier 2 ($$)`, etc. <br> **Continuous:** Tuple `(Credit Limit, Interest Rate)`. |
-| **Reward ($R_t$)** | $R_t = \text{Interest Earned} - \text{Default Loss} - \lambda \cdot (\text{Portfolio Risk Penalty})$. |
-| **Transition ($P$)** | Borrowers transition through repayment states (on-time, late, default) based on underlying stochastic credit transition matrices. |
+1. [Overview](#overview)
+2. [How It Works](#how-it-works)
+3. [Project Structure](#project-structure)
+4. [Dataset](#dataset)
+5. [Installation](#installation)
+6. [Usage](#usage)
+7. [Web App and API](#web-app-and-api)
+8. [Model Details](#model-details)
+9. [Evaluation, Stress Test and Fairness Audit](#evaluation-stress-test-and-fairness-audit)
+10. [Explainability](#explainability)
+11. [Outputs](#outputs)
+12. [Limitations](#limitations)
+13. [Tech Stack](#tech-stack)
+14. [Author](#author)
 
 ---
 
-## 📂 Project Structure
+## Overview
 
-```bash
-RL-micro-loan-underwriting/
-├── data/                      # Sample datasets / synthetic micro-loan data
-│   └── raw/
-├── envs/                      # Simulation environments
-│   ├── __init__.py
-│   └── microloan_env.py       # Custom Gymnasium environment
-├── models/                    # RL agents & baseline models
-│   ├── agents.py              # DQN / PPO wrappers
-│   └── baselines.py           # XGBoost / Scorecard baselines
-├── notebooks/                 # Exploratory data analysis & policy evaluation
-│   └── exploration_and_eval.ipynb
-├── utils/                     # Metrics, reward shapers, and plotting helpers
-│   ├── metrics.py
-│   └── visualizer.py
-├── train.py                   # Model training script
-├── evaluate.py                # Backtesting & benchmarking script
-├── requirements.txt           # Project dependencies
-└── README.md
+Lenders face two linked decisions for every applicant:
+
+1. **Approve or decline?** Approving a loan that defaults is costly; declining a good borrower loses revenue.
+2. **At what rate?** A higher APR earns more per loan but makes the borrower less likely to accept and attracts riskier applicants.
+
+This project treats both as a reinforcement learning problem and solves them with a **two-stage cascade**:
+
+| Stage | Role | Algorithm |
+|-------|------|-----------|
+| **Gatekeeper** | Approve or decline the applicant | Offline Conservative Q-Learning (CQL) on a DQN-style network |
+| **Pricing engine** | Choose a continuous APR for approved applicants | Proximal Policy Optimization (PPO), actor-critic |
+
+The reward also accounts for portfolio-level concerns: a penalty when the trailing default rate (GNPA) rises above 4%, and a penalty when the share of lending to a priority-sector proxy falls below 40%.
+
+---
+
+## How It Works
+
+```mermaid
+flowchart LR
+    A[Loan data<br/>train.csv] --> B[Preprocessing<br/>Mapping.py]
+    B --> C[Gymnasium environment<br/>Enviroment.py]
+    B --> D[Offline buffer<br/>approve + decline rows]
+    D --> E[Phase 2: CQL<br/>QLearning.py]
+    E -->|weights| F[Gatekeeper DQN]
+    C --> G[Phase 3: PPO<br/>Ensemble.py]
+    F --> G
+    G --> H[Pricing actor-critic]
+    F --> I[Checkpoint<br/>outputs/checkpoint]
+    H --> I
+    I --> J[Predictor<br/>Inference.py]
+    J --> K[FastAPI + web UI<br/>api.py, static/]
+```
+
+**Pipeline phases (run by `Main.py`):**
+
+1. **Data ingestion and environment setup.** The raw CSV is cleaned and converted into a 17-feature state, and the custom environment appends 2 portfolio features, giving a 19-dimensional observation.
+2. **Offline CQL warm start.** The historical file only contains funded loans, so each applicant is stored twice: once with the *approve* action (reward based on whether the loan defaulted) and once with the *decline* action (reward of zero). A Conservative Q-Learning loss then trains the gatekeeper without over-estimating actions the data does not support.
+3. **Online PPO pricing.** The gatekeeper's weights are carried over. In the simulated environment, the gatekeeper filters applicants and PPO learns the APR to quote for those it approves.
+4. **Validation and explainability.** A macroeconomic stress test, a segment-level approval audit, scoring of unseen applicants and a SHAP explanation of one decision.
+
+---
+
+## Project Structure
+
+```
+.
+├── Main.py              # Runs the full training and validation pipeline
+├── Mapping.py           # Dataset class: cleaning, feature engineering, scaling
+├── Enviroment.py        # Custom Gymnasium environment (CustomEnv)
+├── QLearning.py         # Offline buffer, Q-network and CQL training loop
+├── Ensemble.py          # Gatekeeper, PPO actor-critic, cascade, stress test, audit, SHAP
+├── Inference.py         # UnderwritingPredictor: save/load checkpoint, batch scoring
+├── api.py               # FastAPI application (REST endpoints + static UI)
+├── app.py               # Entry point exposing the FastAPI app
+├── test_unseen.py       # Smoke test for a saved model on an unlabelled CSV
+├── requirements.txt
+├── Dataset1/            # train.csv, test.csv, Data Dictionary.xlsx (add your own copy)
+├── static/              # Web UI: index.html, styles.css, app.js
+└── outputs/
+    ├── checkpoint/      # underwriting_model.pt, feature_scaler.joblib
+    ├── unseen_predictions.csv
+    ├── smoke_test_predictions.csv
+    └── shap_explanation_<id>.html
 ```
 
 ---
 
-## 🚀 Quickstart
+## Dataset
 
-### 1. Prerequisites & Installation
+The project uses a vehicle-loan dataset with a binary `LOAN_DEFAULT` label in the training file and an unlabelled test file. A `Data Dictionary.xlsx` describes the columns.
 
-Clone the repository and install dependencies:
+| File | Rows | Notes |
+|------|------|-------|
+| `Dataset1/train.csv` | 233,154 | Includes `LOAN_DEFAULT` (about 21.7% positive) |
+| `Dataset1/test.csv` | 112,392 | Unlabelled, used for inference only |
+
+Place your own copy of the files in `Dataset1/`. Because the test file has no labels, it supports inference checks but **not accuracy scoring**.
+
+### Feature engineering (`Mapping.py`)
+
+Ten continuous features are standardised with a `StandardScaler` fitted on the training data only:
+
+- Log of disbursed amount and log of asset cost
+- Loan-to-value ratio
+- New-to-credit flag (credit score of 0)
+- Normalised credit score, scaled from the 300–900 range
+- Total active accounts (primary + secondary, capped at 20)
+- Total overdue accounts (capped at 10)
+- Inquiry velocity (capped at 10)
+- Recent delinquencies in the last six months (capped at 5)
+- Average account age in months
+
+These are followed by:
+
+- A **4-way one-hot customer segment**: salaried or self-employed, crossed with established credit or new-to-credit
+- **Macro features**: repo rate, inflation assumption and a quarter index derived from the disbursal date
+
+The environment then adds two **portfolio-tracking features**: trailing default rate (GNPA) and the priority-sector share of approvals.
+
+---
+
+## Installation
 
 ```bash
-git clone https://github.com/TanyaMIshra14/RL-micro-loan-underwriting.git
-cd RL-micro-loan-underwriting
+git clone https://github.com/TanyaMIshra14/<your-repo-name>.git
+cd <your-repo-name>
 
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+python -m venv venv
+# Windows
+venv\Scripts\activate
+# macOS / Linux
+source venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-### 2. Train an RL Agent
+**Requirements:** `gymnasium`, `fastapi`, `joblib`, `numpy`, `pandas`, `plotly`, `scikit-learn`, `shap`, `torch`, `uvicorn[standard]`, `python-multipart`.
 
-Train an agent on the simulated micro-lending environment:
+---
+
+## Usage
+
+### 1. Train the full pipeline
 
 ```bash
-python train.py --algo ppo --episodes 1000 --seed 42 --save_dir ./saved_models
+python Main.py
 ```
 
-Key arguments:
-* `--algo`: RL algorithm (`dqn`, `ppo`, `sac`).
-* `--episodes`: Total training episodes.
-* `--capital_budget`: Initial portfolio capital constraint.
+This reads `Dataset1/train.csv` and `Dataset1/test.csv`, trains both stages (seeded with `42` for reproducibility), runs the stress test and audit, saves the model to `outputs/checkpoint/`, writes predictions for the test file to `outputs/unseen_predictions.csv` and generates a SHAP report for the first applicant.
 
-### 3. Evaluate and Compare with Baselines
-
-Run policy evaluation against standard credit scorecards:
+### 2. Smoke-test a saved model
 
 ```bash
-python evaluate.py --model_path ./saved_models/best_agent.pt --benchmark xgboost
+python test_unseen.py
+# optional arguments
+python test_unseen.py --rows 100 --input Dataset1/test.csv --checkpoint outputs/checkpoint
 ```
 
-This generates:
-* Cumulative portfolio profit curves.
-* Default rates across applicant risk deciles.
-* Approval rates and policy distribution maps.
+The script checks that the prediction count matches the input, that Q-scores are finite, that the decision margin equals `APPROVE_Q_SCORE - DECLINE_Q_SCORE`, that approved APRs fall inside the 8–36% bounds and that declined applications carry no APR.
+
+### 3. Score programmatically
+
+```python
+from Inference import UnderwritingPredictor
+
+predictor = UnderwritingPredictor.load_checkpoint("outputs/checkpoint")
+predictions, observations = predictor.predict_csv("Dataset1/test.csv")
+print(predictions.head())
+```
 
 ---
 
-## 📊 Evaluation Metrics
+## Web App and API
 
-* **Expected Portfolio Return (ROI):** Total interest yields minus cumulative write-offs over the deployment horizon.
-* **Cumulative Default Rate (CDR):** Percentage of total approved micro-loans reaching 90+ days past due (DPD).
-* **Approval Rate & Opportunity Cost:** Ratio of rejected solvent applicants vs. avoided bad loans.
-* **Gini / KS Statistic (for baselines):** Discrimination metrics evaluated on synthetic or test default outcomes.
+Start the server (a trained checkpoint must exist in `outputs/checkpoint/`):
+
+```bash
+uvicorn app:app --reload
+```
+
+Then open **http://127.0.0.1:8000**. The interface ("Micro-loan Underwriting Lab") has two views:
+
+- **Single application:** enter applicant, credit and account details to receive a decision, the Q-scores, the proposed APR and a ranked list of decision drivers.
+- **Batch scoring:** upload a CSV and receive decisions for every row.
+
+Both views include portfolio assumptions (current GNPA and priority-sector share) that feed into the model's state.
+
+### REST endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/health` | Model-loaded status and whether explanations are available |
+| `POST` | `/api/predict` | Decision and APR for one application (JSON body) |
+| `POST` | `/api/predict-csv` | Batch decisions from an uploaded CSV |
+| `POST` | `/api/explain` | Prediction plus SHAP factors and an HTML report |
+
+Interactive API docs are available at `/docs`. Batch uploads are limited to **10 MB** and **10,000 rows**.
+
+**Example request**
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "application_id": "LIVE-001",
+    "employment_type": "Salaried",
+    "disbursal_date": "2018-10-15",
+    "disbursed_amount": 55000,
+    "asset_cost": 75000,
+    "ltv": 74,
+    "cibil_score": 720,
+    "average_age_years": 2, "average_age_months": 3,
+    "credit_history_years": 4, "credit_history_months": 0,
+    "primary_active_accounts": 2, "secondary_active_accounts": 0,
+    "primary_overdue_accounts": 0, "secondary_overdue_accounts": 0,
+    "inquiries": 1,
+    "recent_delinquencies": 0
+  }'
+```
+
+**Example response**
+
+```json
+{
+  "application_id": "LIVE-001",
+  "decision": "APPROVE",
+  "decline_q_score": 0.0,
+  "approve_q_score": 0.0,
+  "decision_margin": 0.0,
+  "proposed_apr_percent": 0.0
+}
+```
+
+*(Values shown are placeholders; the real numbers depend on the trained checkpoint.)*
 
 ---
 
-## 🛠️ Tech Stack
+## Model Details
 
-* **Language:** Python 3.9+
-* **RL Frameworks:** Gymnasium, PyTorch, Stable-Baselines3
-* **Data & Machine Learning:** NumPy, Pandas, Scikit-learn, XGBoost / LightGBM
-* **Visualization:** Matplotlib, Seaborn
+### Environment (`Enviroment.py`)
+
+| Item | Definition |
+|------|------------|
+| Observation | 19 dimensions (17 application/macro features + GNPA + priority-sector share) |
+| Action | `(approve ∈ {0,1}, APR ∈ [0.08, 0.36])` |
+| Episode length | 2,000 applicants drawn from a random starting point |
+
+**Simulated borrower behaviour**
+
+- *Acceptance:* the probability that a borrower accepts a quote falls as the APR rises, following a logistic curve centred at 18%.
+- *Adverse selection:* APRs above 22% increase the effective default probability.
+
+**Reward**
+
+| Outcome | Reward |
+|---------|--------|
+| Decline | `0` |
+| Approved but borrower rejects the quote | `-0.02` |
+| Approved, accepted, defaulted | `-1` |
+| Approved, accepted, repaid | `(APR − repo rate) × 3.5` |
+| Trailing GNPA above 4% | additional `−5 × (GNPA − 0.04)` |
+| Priority-sector share below 40% (after 20 approvals) | additional `−0.1 × (0.40 − share)` |
+
+### Gatekeeper: offline CQL (`QLearning.py`)
+
+- Network: MLP `19 → 128 → 128 → 2` with ReLU
+- Offline buffer: 30,000 randomly sampled applicants × 2 actions = 60,000 transitions
+- Offline approve reward uses an assumed APR of 18%
+- Training: 3,000 steps, batch size 256, Adam (`lr = 3e-4`), CQL penalty weight `0.1`, soft target updates (`τ = 0.05`)
+- Each applicant is independent, so every transition is one step with `γ = 0`, which makes this a contextual-bandit formulation of Q-learning
+
+### Pricing engine: PPO (`Ensemble.py`)
+
+- Shared backbone `19 → 64 → 64` with Tanh, a Gaussian actor head and a critic head
+- The mean APR is passed through a sigmoid and rescaled into the 8–36% range
+- Generalised Advantage Estimation (`γ = 0.99`, `λ = 0.95`), clip ratio `0.2`, 4 epochs per update
+- 20,000 interaction steps; the policy updates each time 128 approved-loan transitions have been collected
+- During training the gatekeeper uses ε-greedy exploration (`ε = 0.1`)
+
+### Cascade
+
+At inference time the gatekeeper compares `Q(approve)` with `Q(decline)`. If the applicant is declined, no APR is produced. If approved, the PPO actor's mean output becomes the proposed APR.
 
 ---
 
-## 📄 License
+## Evaluation, Stress Test and Fairness Audit
 
-Distributed under the [MIT License](LICENSE).
+`Main.py` runs two checks after training:
+
+**Macroeconomic stress test.** Over 300 steps, the repo rate is raised by **125 basis points** at step 150. The test reports the total reward and the maximum portfolio GNPA reached.
+
+**Segment-level approval audit.** Over 600 simulated applicants, the approval rate is reported for each of four customer segments (salaried or self-employed, with or without an established credit history) so that large gaps between groups are visible.
 
 ---
 
-## 👤 Author
+## Explainability
 
-* **Tanya Mishra** ([@TanyaMIshra14](https://github.com/TanyaMIshra14))
+For any applicant, the project produces an HTML report built with **SHAP** and **Plotly** (see `outputs/shap_explanation_*.html`). SHAP is applied to the gatekeeper's *decision margin* (`Q(approve) − Q(decline)`) and the report shows:
+
+- The decision, Q-scores and margin
+- The factors pushing toward decline and toward approval
+- A bar chart of the 12 most influential features
+
+The explanation describes how the model used its inputs. It does not establish causality or fairness and is not a validated adverse-action reason code.
+
+---
+
+## Outputs
+
+`unseen_predictions.csv` contains one row per test applicant:
+
+| Column | Meaning |
+|--------|---------|
+| `UNIQUEID` | Applicant identifier |
+| `DECISION` | `APPROVE` or `DECLINE` |
+| `DECLINE_Q_SCORE`, `APPROVE_Q_SCORE` | Learned Q-values for each action (not probabilities) |
+| `DECISION_MARGIN` | Approve score minus decline score |
+| `PROPOSED_APR_PERCENT` | Quoted APR for approved applicants, empty otherwise |
+| `PORTFOLIO_GNPA_INPUT`, `PORTFOLIO_PSL_SHARE_INPUT` | Portfolio assumptions used for the prediction |
+
+In the included output file, 112,392 test applicants are scored, with about 71.7% approved.
+
+---
+
+## Limitations
+
+- **Simulated environment.** Borrower acceptance, adverse selection and the reward weights are modelling assumptions, not observed behaviour. The policy is only as realistic as those assumptions.
+- **Offline rewards are approximate.** Offline approve rewards use a fixed assumed APR (18%), and the macro inputs (repo rate, inflation) are fixed constants in `Mapping.py` rather than real time series.
+- **Limited price differentiation.** In the included prediction output, approved applicants receive APRs in a narrow band (mean about 30%). The pricing policy would benefit from further tuning of the reward and exploration settings.
+- **Priority-sector share is a proxy.** It is computed from the established-credit segments and should be redefined to match a real regulatory definition.
+- **No labelled evaluation on the test set.** The test file has no outcomes, so approval quality on unseen data cannot be measured here.
+- **Not a production credit system.** Fairness, compliance and model-risk review would be required before any real-world use.
+
+---
+
+## Tech Stack
+
+**Language:** Python  
+**Reinforcement learning:** PyTorch, Gymnasium (CQL, DQN, PPO)  
+**Data and ML utilities:** NumPy, pandas, scikit-learn, joblib  
+**Explainability and visualisation:** SHAP, Plotly  
+**Serving:** FastAPI, Uvicorn, HTML/CSS/JavaScript front end
+
+---
+
+## Author
+
+**Tanya Mishra**  
+GitHub: [@TanyaMIshra14](https://github.com/TanyaMIshra14)
